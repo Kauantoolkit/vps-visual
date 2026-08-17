@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VPS Visual</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <header>
+    <h1>VPS Visual</h1>
+    <span class="connection">● conectado</span>
+  </header>
+
+  <!-- Command bar — shows the equivalent bash command -->
+  <div id="command-bar">
+    <span class="prompt">$</span>
+    <span class="cmd" id="cmd-text">ls -la /</span>
+    <button class="copy-btn" onclick="copyCommand()">copiar</button>
+  </div>
+
+  <!-- Breadcrumb -->
+  <div id="breadcrumb">
+    <span onclick="navigate('/')">/</span>
+  </div>
+
+  <main>
+    <!-- Sidebar -->
+    <div id="sidebar">
+      <div class="section-title">Navegacao</div>
+      <button onclick="goHome()"><span class="icon">&#127968;</span> Home (/root)</button>
+      <button onclick="goRoot()"><span class="icon">&#128193;</span> Raiz do sistema (/)</button>
+      <button onclick="goVarLog()"><span class="icon">&#128203;</span> Logs do sistema</button>
+      <button onclick="goOpt()"><span class="icon">&#128230;</span> Programas (/opt)</button>
+      <button onclick="goEtc()"><span class="icon">&#9881;</span> Configuracoes (/etc)</button>
+
+      <div class="section-title">Monitoramento</div>
+      <button onclick="showDisk()"><span class="icon">&#128190;</span> Disco / RAM</button>
+      <button onclick="showDocker()"><span class="icon">&#128051;</span> Containers Docker</button>
+      <button onclick="showServices()"><span class="icon">&#9881;</span> Servicos ativos</button>
+
+      <div class="section-title">Terminal</div>
+      <button onclick="toggleTerminal()"><span class="icon">&#62;</span> Terminal (Ctrl+`)</button>
+      <button onclick="toggleHistory()"><span class="icon">&#128340;</span> Comandos executados</button>
+    </div>
+
+    <!-- File list -->
+    <div id="file-panel">
+      <div id="toolbar">
+        <button onclick="navigate(state.path)">&#8635; Atualizar</button>
+        <button onclick="createFolder()">&#128193;+ Nova pasta</button>
+        <button onclick="createFile()">&#128196;+ Novo arquivo</button>
+      </div>
+      <div id="file-list">
+        <div class="loading">carregando...</div>
+      </div>
+    </div>
+
+    <!-- Preview panel -->
+    <div id="preview-panel">
+      <div id="preview-header">
+        <span class="title"></span>
+        <button onclick="closePreview()">&#10005;</button>
+      </div>
+      <div id="preview-content"></div>
+    </div>
+
+    <!-- History panel -->
+    <div id="history-panel">
+      <div class="section-title">Comandos executados</div>
+      <div id="history-list"></div>
+    </div>
+  </main>
+
+  <!-- Terminal -->
+  <div id="terminal-panel">
+    <div id="terminal-output"></div>
+    <div id="terminal-input-row">
+      <span class="prompt">root@vps:~$</span>
+      <input type="text" id="terminal-input" placeholder="digite um comando..."
+             onkeydown="if(event.key==='Enter')terminalExec()">
+    </div>
+  </div>
+
+  <!-- Context menu -->
+  <div id="context-menu"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
