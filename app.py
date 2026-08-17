@@ -1,7 +1,7 @@
 """VPS Visual — navegador visual de VPS que mostra os comandos equivalentes."""
 import os, json, time
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 import paramiko
 
 # Load .env file if exists
@@ -14,19 +14,28 @@ if env_path.exists():
             os.environ.setdefault(key.strip(), val.strip())
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-# Configuração da VPS — defina via variáveis de ambiente ou .env
-VPS_HOST = os.environ.get("VPS_HOST", "")
-VPS_USER = os.environ.get("VPS_USER", "root")
-VPS_PASS = os.environ.get("VPS_PASS", "")
-VPS_PORT = int(os.environ.get("VPS_PORT", "22"))
+# In-memory connection store (per session)
+connections = {}
+
+
+def get_conn():
+    """Get connection info from session."""
+    sid = session.get("sid")
+    if sid and sid in connections:
+        return connections[sid]
+    return None
 
 
 def ssh_exec(cmd, timeout=15):
     """Executa um comando na VPS e retorna (stdout, stderr, exit_code)."""
+    conn = get_conn()
+    if not conn:
+        raise ConnectionError("Nao conectado")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, password=VPS_PASS, timeout=10)
+    client.connect(conn["host"], port=conn["port"], username=conn["user"], password=conn["pass"], timeout=10)
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
@@ -40,21 +49,78 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/connect", methods=["POST"])
+def api_connect():
+    host = request.json.get("host", "").strip()
+    user = request.json.get("user", "root").strip()
+    password = request.json.get("password", "")
+    port = int(request.json.get("port", 22))
+
+    if not host:
+        return jsonify({"success": False, "error": "Host vazio"})
+
+    # Test connection
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, port=port, username=user, password=password, timeout=10)
+        stdin, stdout, stderr = client.exec_command("hostname && uname -a", timeout=10)
+        info = stdout.read().decode("utf-8", errors="replace").strip()
+        client.close()
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+    # Store connection
+    import uuid
+    sid = str(uuid.uuid4())
+    session["sid"] = sid
+    connections[sid] = {
+        "host": host,
+        "user": user,
+        "pass": password,
+        "port": port,
+    }
+
+    return jsonify({
+        "success": True,
+        "info": info,
+        "host": host,
+        "user": user,
+    })
+
+
+@app.route("/api/disconnect", methods=["POST"])
+def api_disconnect():
+    sid = session.get("sid")
+    if sid and sid in connections:
+        del connections[sid]
+    session.pop("sid", None)
+    return jsonify({"success": True})
+
+
+@app.route("/api/status", methods=["POST"])
+def api_status():
+    conn = get_conn()
+    if conn:
+        return jsonify({"connected": True, "host": conn["host"], "user": conn["user"]})
+    return jsonify({"connected": False})
+
+
 @app.route("/api/ls", methods=["POST"])
 def api_ls():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado", "items": []})
     path = request.json.get("path", "/")
-    # Sanitize
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
     cmd = f'ls -la --time-style=long-iso "{path}" 2>&1'
     out, err, code = ssh_exec(cmd)
 
     items = []
-    for line in out.strip().split("\n")[1:]:  # skip "total X"
+    for line in out.strip().split("\n")[1:]:
         parts = line.split(None, 7)
         if len(parts) < 8:
             continue
         perms, links, owner, group, size, date, hour, name = parts
-        # Symlinks: "bin -> usr/bin" — keep only the link name
         if " -> " in name:
             name = name.split(" -> ")[0]
         if name in (".", ".."):
@@ -80,6 +146,8 @@ def api_ls():
 
 @app.route("/api/cat", methods=["POST"])
 def api_cat():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
     max_lines = request.json.get("max_lines", 200)
@@ -96,6 +164,8 @@ def api_cat():
 
 @app.route("/api/tail", methods=["POST"])
 def api_tail():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
     lines = request.json.get("lines", 50)
@@ -112,6 +182,8 @@ def api_tail():
 
 @app.route("/api/mkdir", methods=["POST"])
 def api_mkdir():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
 
@@ -127,6 +199,8 @@ def api_mkdir():
 
 @app.route("/api/rm", methods=["POST"])
 def api_rm():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
     is_dir = request.json.get("is_dir", False)
@@ -149,6 +223,8 @@ def api_rm():
 
 @app.route("/api/mv", methods=["POST"])
 def api_mv():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     src = request.json.get("src", "")
     dst = request.json.get("dst", "")
     for ch in [";", "&&", "|", "`"]:
@@ -167,14 +243,16 @@ def api_mv():
 
 @app.route("/api/write", methods=["POST"])
 def api_write():
+    conn = get_conn()
+    if not conn:
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     content = request.json.get("content", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
 
-    # Upload via SFTP
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, password=VPS_PASS, timeout=10)
+    client.connect(conn["host"], port=conn["port"], username=conn["user"], password=conn["pass"], timeout=10)
     sftp = client.open_sftp()
     with sftp.file(path, "w") as f:
         f.write(content)
@@ -189,6 +267,8 @@ def api_write():
 
 @app.route("/api/exec", methods=["POST"])
 def api_exec():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     cmd = request.json.get("command", "")
     timeout = request.json.get("timeout", 15)
     out, err, code = ssh_exec(cmd, timeout=min(timeout, 30))
@@ -203,6 +283,8 @@ def api_exec():
 
 @app.route("/api/info", methods=["POST"])
 def api_info():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
 
@@ -218,6 +300,8 @@ def api_info():
 
 @app.route("/api/disk", methods=["POST"])
 def api_disk():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     out, err, code = ssh_exec("df -h / && echo '---' && free -h")
     return jsonify({
         "command": "df -h / && free -h",
@@ -227,6 +311,8 @@ def api_disk():
 
 @app.route("/api/docker/ps", methods=["POST"])
 def api_docker_ps():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     cmd = 'docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"'
     out, err, code = ssh_exec(cmd)
     return jsonify({
@@ -238,6 +324,8 @@ def api_docker_ps():
 
 @app.route("/api/docker/logs", methods=["POST"])
 def api_docker_logs():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     name = request.json.get("name", "")
     name = name.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
     lines = request.json.get("lines", 50)
@@ -253,6 +341,8 @@ def api_docker_logs():
 
 @app.route("/api/services", methods=["POST"])
 def api_services():
+    if not get_conn():
+        return jsonify({"error": "Nao conectado"})
     cmd = "systemctl list-units --type=service --state=running --no-pager --no-legend"
     out, err, code = ssh_exec(cmd)
     return jsonify({
@@ -263,5 +353,4 @@ def api_services():
 
 if __name__ == "__main__":
     print("VPS Visual rodando em http://localhost:5000")
-    print(f"Conectando em {VPS_USER}@{VPS_HOST}:{VPS_PORT}")
     app.run(debug=True, port=5000)

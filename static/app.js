@@ -430,5 +430,55 @@ function fileIcon(name) {
   return icons[ext] || "&#128196;";
 }
 
+// ── Connection ──
+
+async function doConnect() {
+  const host = document.getElementById("login-host").value.trim();
+  const port = document.getElementById("login-port").value || "22";
+  const user = document.getElementById("login-user").value.trim() || "root";
+  const pass = document.getElementById("login-pass").value;
+  const errEl = document.getElementById("login-error");
+  const btn = document.getElementById("login-btn");
+
+  if (!host) { errEl.textContent = "Digite o IP ou hostname"; return; }
+
+  errEl.textContent = "";
+  btn.textContent = "conectando...";
+  btn.classList.add("loading");
+
+  const data = await api("connect", { host, port: parseInt(port), user, password: pass });
+
+  btn.textContent = "conectar";
+  btn.classList.remove("loading");
+
+  if (data.success) {
+    document.getElementById("login-screen").style.display = "none";
+    document.getElementById("app").style.display = "flex";
+    document.getElementById("conn-info").textContent = `${data.user}@${data.host}`;
+    document.getElementById("terminal-prompt").textContent = `${data.user}@${data.host}:~$`;
+    navigate("/root");
+  } else {
+    errEl.textContent = data.error || "Falha na conexao";
+  }
+}
+
+async function doDisconnect() {
+  await api("disconnect");
+  document.getElementById("app").style.display = "none";
+  document.getElementById("login-screen").style.display = "flex";
+  document.getElementById("login-error").textContent = "";
+  state.history = [];
+}
+
 // ── Init ──
-navigate("/root");
+// Check if already connected (page refresh)
+(async () => {
+  const data = await api("status");
+  if (data.connected) {
+    document.getElementById("login-screen").style.display = "none";
+    document.getElementById("app").style.display = "flex";
+    document.getElementById("conn-info").textContent = `${data.user}@${data.host}`;
+    document.getElementById("terminal-prompt").textContent = `${data.user}@${data.host}:~$`;
+    navigate("/root");
+  }
+})();
