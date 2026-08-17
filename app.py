@@ -1,5 +1,5 @@
 """VPS Visual — navegador visual de VPS que mostra os comandos equivalentes."""
-import os, json, time
+import os, json, time, threading, uuid, re
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, session
 import paramiko
@@ -16,32 +16,71 @@ if env_path.exists():
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-# In-memory connection store (per session)
-connections = {}
+# In-memory session store: sid -> { client, cwd, host, user }
+sessions = {}
+sessions_lock = threading.Lock()
+
+# Unique end-marker to detect when command output finishes
+MARKER = "___VPS_VISUAL_END___"
 
 
-def get_conn():
-    """Get connection info from session."""
+def get_sess():
+    """Get persistent SSH session from flask session id."""
     sid = session.get("sid")
-    if sid and sid in connections:
-        return connections[sid]
+    if sid:
+        with sessions_lock:
+            return sessions.get(sid)
     return None
 
 
 def ssh_exec(cmd, timeout=15):
-    """Executa um comando na VPS e retorna (stdout, stderr, exit_code)."""
-    conn = get_conn()
-    if not conn:
+    """Execute command in persistent SSH connection, preserving cwd."""
+    sess = get_sess()
+    if not sess:
         raise ConnectionError("Nao conectado")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(conn["host"], port=conn["port"], username=conn["user"], password=conn["pass"], timeout=10)
-    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    out = stdout.read().decode("utf-8", errors="replace")
+
+    client = sess["client"]
+    cwd = sess["cwd"]
+
+    # Wrap command so it runs in the current working directory and reports
+    # the new cwd afterwards (so cd works across calls)
+    wrapped = (
+        f'cd {cwd} 2>/dev/null; {cmd}\n'
+        f'__exit_code=$?\n'
+        f'echo ""\n'
+        f'echo "{MARKER}_EXIT_${{__exit_code}}"\n'
+        f'echo "{MARKER}_CWD_$(pwd)"\n'
+    )
+
+    stdin, stdout, stderr = client.exec_command(wrapped, timeout=timeout)
+    raw_out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
-    code = stdout.channel.recv_exit_status()
-    client.close()
-    return out, err, code
+
+    # Parse exit code and new cwd from output
+    exit_code = 0
+    new_cwd = cwd
+    clean_lines = []
+    for line in raw_out.split("\n"):
+        if f"{MARKER}_EXIT_" in line:
+            try:
+                exit_code = int(line.split(f"{MARKER}_EXIT_")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif f"{MARKER}_CWD_" in line:
+            parsed = line.split(f"{MARKER}_CWD_")[1].strip()
+            if parsed:
+                new_cwd = parsed
+        else:
+            clean_lines.append(line)
+
+    # Update stored cwd
+    sess["cwd"] = new_cwd
+
+    out = "\n".join(clean_lines)
+    # Remove trailing blank lines from our echo
+    out = out.rstrip("\n") + "\n" if out.strip() else ""
+
+    return out, err, exit_code
 
 
 @app.route("/")
@@ -59,27 +98,28 @@ def api_connect():
     if not host:
         return jsonify({"success": False, "error": "Host vazio"})
 
-    # Test connection
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(host, port=port, username=user, password=password, timeout=10)
         stdin, stdout, stderr = client.exec_command("hostname && uname -a", timeout=10)
         info = stdout.read().decode("utf-8", errors="replace").strip()
-        client.close()
+        # Get initial home directory
+        stdin2, stdout2, stderr2 = client.exec_command("pwd", timeout=5)
+        home = stdout2.read().decode("utf-8", errors="replace").strip() or "/root"
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
-    # Store connection
-    import uuid
+    # Store persistent connection
     sid = str(uuid.uuid4())
     session["sid"] = sid
-    connections[sid] = {
-        "host": host,
-        "user": user,
-        "pass": password,
-        "port": port,
-    }
+    with sessions_lock:
+        sessions[sid] = {
+            "client": client,
+            "host": host,
+            "user": user,
+            "cwd": home,
+        }
 
     return jsonify({
         "success": True,
@@ -92,23 +132,39 @@ def api_connect():
 @app.route("/api/disconnect", methods=["POST"])
 def api_disconnect():
     sid = session.get("sid")
-    if sid and sid in connections:
-        del connections[sid]
+    if sid:
+        with sessions_lock:
+            sess = sessions.pop(sid, None)
+            if sess and sess.get("client"):
+                try:
+                    sess["client"].close()
+                except Exception:
+                    pass
     session.pop("sid", None)
     return jsonify({"success": True})
 
 
 @app.route("/api/status", methods=["POST"])
 def api_status():
-    conn = get_conn()
-    if conn:
-        return jsonify({"connected": True, "host": conn["host"], "user": conn["user"]})
+    sess = get_sess()
+    if sess:
+        # Verify connection is still alive
+        try:
+            transport = sess["client"].get_transport()
+            if transport and transport.is_active():
+                return jsonify({"connected": True, "host": sess["host"], "user": sess["user"]})
+        except Exception:
+            pass
+        # Dead connection — clean up
+        with sessions_lock:
+            sessions.pop(session.get("sid"), None)
+        session.pop("sid", None)
     return jsonify({"connected": False})
 
 
 @app.route("/api/ls", methods=["POST"])
 def api_ls():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado", "items": []})
     path = request.json.get("path", "/")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -146,7 +202,7 @@ def api_ls():
 
 @app.route("/api/cat", methods=["POST"])
 def api_cat():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -164,7 +220,7 @@ def api_cat():
 
 @app.route("/api/tail", methods=["POST"])
 def api_tail():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -182,7 +238,7 @@ def api_tail():
 
 @app.route("/api/mkdir", methods=["POST"])
 def api_mkdir():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -199,7 +255,7 @@ def api_mkdir():
 
 @app.route("/api/rm", methods=["POST"])
 def api_rm():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -223,7 +279,7 @@ def api_rm():
 
 @app.route("/api/mv", methods=["POST"])
 def api_mv():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     src = request.json.get("src", "")
     dst = request.json.get("dst", "")
@@ -243,21 +299,17 @@ def api_mv():
 
 @app.route("/api/write", methods=["POST"])
 def api_write():
-    conn = get_conn()
-    if not conn:
+    sess = get_sess()
+    if not sess:
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     content = request.json.get("content", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(conn["host"], port=conn["port"], username=conn["user"], password=conn["pass"], timeout=10)
-    sftp = client.open_sftp()
+    sftp = sess["client"].open_sftp()
     with sftp.file(path, "w") as f:
         f.write(content)
     sftp.close()
-    client.close()
 
     return jsonify({
         "command": f"nano {path}",
@@ -267,7 +319,8 @@ def api_write():
 
 @app.route("/api/exec", methods=["POST"])
 def api_exec():
-    if not get_conn():
+    sess = get_sess()
+    if not sess:
         return jsonify({"error": "Nao conectado"})
     cmd = request.json.get("command", "")
     timeout = request.json.get("timeout", 15)
@@ -278,12 +331,13 @@ def api_exec():
         "stdout": out,
         "stderr": err,
         "exit_code": code,
+        "cwd": sess["cwd"],
     })
 
 
 @app.route("/api/info", methods=["POST"])
 def api_info():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     path = request.json.get("path", "")
     path = path.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -300,7 +354,7 @@ def api_info():
 
 @app.route("/api/disk", methods=["POST"])
 def api_disk():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     out, err, code = ssh_exec("df -h / && echo '---' && free -h")
     return jsonify({
@@ -311,7 +365,7 @@ def api_disk():
 
 @app.route("/api/docker/ps", methods=["POST"])
 def api_docker_ps():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     cmd = 'docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"'
     out, err, code = ssh_exec(cmd)
@@ -324,7 +378,7 @@ def api_docker_ps():
 
 @app.route("/api/docker/logs", methods=["POST"])
 def api_docker_logs():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     name = request.json.get("name", "")
     name = name.replace(";", "").replace("&&", "").replace("|", "").replace("`", "")
@@ -341,7 +395,7 @@ def api_docker_logs():
 
 @app.route("/api/services", methods=["POST"])
 def api_services():
-    if not get_conn():
+    if not get_sess():
         return jsonify({"error": "Nao conectado"})
     cmd = "systemctl list-units --type=service --state=running --no-pager --no-legend"
     out, err, code = ssh_exec(cmd)

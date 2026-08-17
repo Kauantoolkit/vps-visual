@@ -6,6 +6,9 @@ const state = {
   terminalOpen: false,
   historyOpen: false,
   previewOpen: false,
+  connUser: "root",
+  connHost: "vps",
+  termCwd: "~",
 };
 
 // ── API ──
@@ -381,13 +384,23 @@ async function terminalExec() {
   if (!cmd) return;
 
   input.value = "";
-  output.innerHTML += `<span style="color:var(--green)">root@vps</span>:<span style="color:var(--accent)">${escHtml(state.path)}</span>$ ${escHtml(cmd)}\n`;
+  const promptUser = state.connUser || "root";
+  const promptHost = state.connHost || "vps";
+  const promptCwd = state.termCwd || "~";
+  output.innerHTML += `<span style="color:var(--green)">${escHtml(promptUser)}@${escHtml(promptHost)}</span>:<span style="color:var(--accent)">${escHtml(promptCwd)}</span>$ ${escHtml(cmd)}\n`;
 
   const data = await api("exec", { command: cmd });
   if (data.stdout) output.innerHTML += escHtml(data.stdout);
   if (data.stderr) output.innerHTML += `<span style="color:var(--red)">${escHtml(data.stderr)}</span>`;
   if (data.exit_code !== 0) {
     output.innerHTML += `<span style="color:var(--red)">[exit ${data.exit_code}]</span>\n`;
+  }
+
+  // Update cwd from server response (cd persists!)
+  if (data.cwd) {
+    state.termCwd = data.cwd;
+    const promptEl = document.getElementById("terminal-prompt");
+    if (promptEl) promptEl.textContent = `${promptUser}@${promptHost}:${data.cwd}$`;
   }
 
   output.scrollTop = output.scrollHeight;
@@ -452,6 +465,9 @@ async function doConnect() {
   btn.classList.remove("loading");
 
   if (data.success) {
+    state.connUser = data.user;
+    state.connHost = data.host;
+    state.termCwd = "~";
     document.getElementById("login-screen").style.display = "none";
     document.getElementById("app").style.display = "flex";
     document.getElementById("conn-info").textContent = `${data.user}@${data.host}`;
@@ -475,6 +491,9 @@ async function doDisconnect() {
 (async () => {
   const data = await api("status");
   if (data.connected) {
+    state.connUser = data.user;
+    state.connHost = data.host;
+    state.termCwd = "~";
     document.getElementById("login-screen").style.display = "none";
     document.getElementById("app").style.display = "flex";
     document.getElementById("conn-info").textContent = `${data.user}@${data.host}`;
